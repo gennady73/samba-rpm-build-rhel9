@@ -1,0 +1,59 @@
+# =============================================================================
+# File: spec/samba.spec.in
+# Description: Externalized RPM spec template for Samba 4 AD DC on RHEL 9
+# =============================================================================
+%global debug_package %{nil}
+
+Name:           samba-ad-dc
+Version:        @VERSION@
+Release:        1%{?dist}
+Summary:        Samba 4 Active Directory Domain Controller for RHEL 9
+
+License:        GPLv3+
+URL:            https://www.samba.org/
+Source0:        @TAR_NAME@
+
+AutoReqProv:    no
+Requires:       krb5-server gnutls bind bind-utils jansson libarchive libicu dbus popt python3 python3-cryptography python3-dns python3-markdown
+
+%description
+Custom compiled Samba 4 Active Directory Domain Controller package built against
+system MIT Kerberos for RHEL 9 / UBI9 environments.
+
+%prep
+%setup -q -c -n samba-@RAW_VER@
+tar -xzf %{SOURCE0} --strip-components=1
+
+%build
+# Binaries are pre-compiled during container build step
+exit 0
+
+%install
+rm -rf %{buildroot}
+cd /build/samba
+PYTHONHASHSEED=1 DESTDIR=%{buildroot} make install
+
+# Copy systemd unit if present
+mkdir -p %{buildroot}/usr/lib/systemd/system
+if [ -f packaging/systemd/samba.service ]; then
+    cp packaging/systemd/samba.service %{buildroot}/usr/lib/systemd/system/samba.service
+fi
+
+%clean
+rm -rf %{buildroot}
+
+%files
+%defattr(-,root,root,-)
+/usr/bin/*
+/usr/sbin/*
+/usr/lib64/*
+/usr/lib/*
+/usr/libexec/*
+/usr/share/*
+/usr/include/*
+/etc/samba
+/var/lib/samba
+/var/log/samba
+/var/run/samba
+/var/cache/samba
+/var/lock/samba

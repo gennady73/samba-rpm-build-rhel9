@@ -1,0 +1,20 @@
+### PyCharm ###
+.idea/*
+
+
+### VisualStudioCode ###
+.vscode/*
+.history/
+
+### Project Specific ###
+
+# Output directory binaries 
+output/*.rpm
+output/*.spec
+!output/.gitkeep
+
+# Logs and temporary execution files 
+*.log
+*.log.txt
+scratch/
+.podman-build/

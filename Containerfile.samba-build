@@ -1,0 +1,35 @@
+# =============================================================================
+# File: Containerfile.samba-build
+# Description: RHEL 9 / UBI 9 Build Container Environment for Samba 4 AD DC RPM
+# =============================================================================
+FROM registry.access.redhat.com/ubi9/ubi:latest
+
+ARG RH_USER
+ARG RH_PASS
+
+# Register Red Hat subscription (if credentials supplied), install toolchains, and unregister
+RUN if [ -n "${RH_USER:-}" ] && [ -n "${RH_PASS:-}" ]; then \
+        subscription-manager register --username="${RH_USER}" --password="${RH_PASS}" && \
+        subscription-manager repos \
+            --enable=rhel-9-for-x86_64-appstream-rpms \
+            --enable=rhel-9-for-x86_64-baseos-rpms \
+            --enable=codeready-builder-for-rhel-9-x86_64-rpms ; \
+    fi && \
+    dnf install -y \
+        gcc make autoconf automake python3-devel python3-markdown python3-dns python3-cryptography flex bison \
+        perl-Parse-Yapp perl-FindBin perl-File-Compare perl-File-Copy perl-devel \
+        krb5-devel krb5-server \
+        libacl-devel libattr-devel \
+        openldap-devel pam-devel \
+        gnutls-devel gpgme-devel \
+        libtirpc-devel jansson-devel popt-devel \
+        libarchive-devel libicu-devel dbus-devel \
+        libxml2-devel libxslt-devel bind-devel \
+        docbook-style-xsl docbook-dtds \
+        rpm-build rsync git && \
+    if subscription-manager status >/dev/null 2>&1; then \
+        subscription-manager unregister ; \
+    fi && \
+    dnf clean all
+
+WORKDIR /build

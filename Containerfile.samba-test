@@ -1,0 +1,26 @@
+# =============================================================================
+# File: Containerfile.samba-test
+# Description: RHEL 9 / UBI 9 Smoke Test Container Environment for Samba AD DC
+# =============================================================================
+FROM registry.access.redhat.com/ubi9/ubi:latest
+
+ARG RH_USER
+ARG RH_PASS
+
+# Register Red Hat subscription (if credentials supplied), install test dependencies, and unregister
+RUN if [ -n "${RH_USER:-}" ] && [ -n "${RH_PASS:-}" ]; then \
+        subscription-manager register --username="${RH_USER}" --password="${RH_PASS}" && \
+        subscription-manager repos \
+            --enable=rhel-9-for-x86_64-appstream-rpms \
+            --enable=rhel-9-for-x86_64-baseos-rpms ; \
+    fi && \
+    dnf install -y \
+        krb5-server krb5-workstation gnutls bind bind-utils \
+        jansson libarchive libicu dbus popt python3-dns python3-markdown \
+        python3-cryptography python3-cffi procps-ng iproute && \
+    if subscription-manager status >/dev/null 2>&1; then \
+        subscription-manager unregister ; \
+    fi && \
+    dnf clean all
+
+WORKDIR /test
