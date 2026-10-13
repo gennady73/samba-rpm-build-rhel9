@@ -1,23 +1,29 @@
 # =============================================================================
 # File: Containerfile.samba-test
-# Description: RHEL 9 / UBI 9 Smoke Test Container Environment for Samba AD DC
+# Description: UBI 9 runtime-test image for the samba-ad-dc RPM.
+#
+# Holds every runtime dependency, so `scripts/test-samba-rpm.sh --offline`
+# can install the RPM with all repositories disabled.
+#
+# Credentials: on a registered RHEL host podman passes the host subscription
+# into UBI builds automatically; nothing is needed. On other hosts pass
+#   podman build --secret id=rhsm,src=<file with RH_USER=... RH_PASS=...>
+# The secret is mounted for one RUN step only and never stored in a layer.
+# NEVER use --build-arg for passwords: build args are kept in image history.
 # =============================================================================
 FROM registry.access.redhat.com/ubi9/ubi:latest
 
-ARG RH_USER
-ARG RH_PASS
-
-# Register Red Hat subscription (if credentials supplied), install test dependencies, and unregister
-RUN if [ -n "${RH_USER:-}" ] && [ -n "${RH_PASS:-}" ]; then \
-        subscription-manager register --username="${RH_USER}" --password="${RH_PASS}" && \
-        subscription-manager repos \
-            --enable=rhel-9-for-x86_64-appstream-rpms \
-            --enable=rhel-9-for-x86_64-baseos-rpms ; \
+RUN --mount=type=secret,id=rhsm,required=false \
+    if [ -s /run/secrets/rhsm ]; then \
+        . /run/secrets/rhsm && \
+        subscription-manager register --username="${RH_USER}" --password="${RH_PASS}" ; \
     fi && \
     dnf install -y \
-        krb5-server krb5-workstation gnutls bind bind-utils \
-        jansson libarchive libicu dbus popt python3-dns python3-markdown \
-        python3-cryptography python3-cffi procps-ng iproute && \
+        krb5-server krb5-workstation bind bind-utils \
+        gnutls jansson libarchive libicu dbus-libs popt lmdb-libs gpgme libtasn1 \
+        openldap pam libacl libcap libtirpc \
+        python3 python3-cryptography python3-dns python3-markdown \
+        procps-ng iproute hostname findutils && \
     if subscription-manager status >/dev/null 2>&1; then \
         subscription-manager unregister ; \
     fi && \

@@ -1,59 +1,135 @@
 # =============================================================================
 # File: spec/samba.spec.in
-# Description: Externalized RPM spec template for Samba 4 AD DC on RHEL 9
+# Description: RPM spec template for Samba 4 AD DC on RHEL 9 (MIT Kerberos).
+#
+# Self-contained: %build compiles from Source0, so the SRPM rebuilds on its
+# own (rpmbuild --rebuild). Placeholders are filled by build-samba-rpm.sh.
 # =============================================================================
 %global debug_package %{nil}
 
+# Samba's bundled private libraries (talloc, tdb, ldb, ...) live in
+# the samba subdirectory of the libdir and are not system-wide ABI: keep them out of the
+# automatic Provides/Requires so they cannot satisfy or demand anything else.
+%global __provides_exclude_from ^%{_libdir}/samba/.*$
+%global __requires_exclude ^lib.*-private-samba\\.so.*$
+
 Name:           samba-ad-dc
 Version:        @VERSION@
-Release:        1%{?dist}
-Summary:        Samba 4 Active Directory Domain Controller for RHEL 9
+Release:        2%{?dist}
+Summary:        Samba 4 Active Directory Domain Controller for RHEL 9 (MIT Kerberos)
 
-License:        GPLv3+
+License:        GPL-3.0-or-later
 URL:            https://www.samba.org/
 Source0:        @TAR_NAME@
 
-AutoReqProv:    no
-Requires:       krb5-server gnutls bind bind-utils jansson libarchive libicu dbus popt python3 python3-cryptography python3-dns python3-markdown
+# Automatic dependency generation is ON (ELF sonames, python ABI).
+# Python modules are not detected automatically, so list them explicitly.
+Requires:       krb5-server
+Requires:       python3-cryptography
+Requires:       python3-dns
+Requires:       python3-markdown
+Recommends:     bind
+Recommends:     bind-utils
+
+# This single package installs the client libraries, tools and Python
+# bindings that RHEL 9 ships in separate packages. Declare the conflict so
+# dnf reports it clearly instead of failing on individual file clashes.
+Conflicts:      samba-client-libs
+Conflicts:      samba-common-libs
+Conflicts:      samba-client
+Conflicts:      libsmbclient
+Conflicts:      libwbclient
+Conflicts:      samba-winbind-clients
+Conflicts:      samba-winbind-modules
+Conflicts:      python3-samba
+Conflicts:      python3-ldb
+Conflicts:      python3-talloc
+Conflicts:      python3-tdb
+Conflicts:      python3-tevent
+
+%{?systemd_requires}
 
 %description
-Custom compiled Samba 4 Active Directory Domain Controller package built against
-system MIT Kerberos for RHEL 9 / UBI9 environments.
+Custom-compiled Samba 4 Active Directory Domain Controller built against the
+system MIT Kerberos for RHEL 9 / UBI 9.
+
+Note: Samba upstream classifies the MIT Kerberos AD DC as experimental.
 
 %prep
-%setup -q -c -n samba-@RAW_VER@
-tar -xzf %{SOURCE0} --strip-components=1
+%setup -q -n samba-@RAW_VER@
 
 %build
-# Binaries are pre-compiled during container build step
-exit 0
+./configure \
+    --prefix=%{_prefix} \
+    --exec-prefix=%{_exec_prefix} \
+    --libdir=%{_libdir} \
+    --sysconfdir=%{_sysconfdir} \
+    --localstatedir=%{_localstatedir} \
+    --with-piddir=/run/samba \
+    --with-sockets-dir=/run/samba \
+    --with-pammodulesdir=%{_libdir}/security \
+    --with-systemddir=%{_unitdir} \
+    --systemd-install-services \
+    --with-system-mitkrb5 \
+    --with-experimental-mit-ad-dc \
+    --enable-fhs \
+    --disable-cups \
+    --disable-iprint \
+    --without-systemd
+PYTHONHASHSEED=1 %make_build
 
 %install
-rm -rf %{buildroot}
-cd /build/samba
-PYTHONHASHSEED=1 DESTDIR=%{buildroot} make install
+PYTHONHASHSEED=1 %make_install
 
-# Copy systemd unit if present
-mkdir -p %{buildroot}/usr/lib/systemd/system
-if [ -f packaging/systemd/samba.service ]; then
-    cp packaging/systemd/samba.service %{buildroot}/usr/lib/systemd/system/samba.service
-fi
+# The build host has no systemd-devel, so samba cannot sd_notify(): run the
+# AD daemon as Type=simple in the foreground instead of Type=notify.
+sed -i -e 's/^Type=notify/Type=simple/' -e '/^PIDFile=/d' \
+    %{buildroot}%{_unitdir}/samba.service
+# Only the AD DC unit belongs to this package; smbd/nmbd/winbind are started
+# by the samba daemon itself on a DC.
+rm -f %{buildroot}%{_unitdir}/{smb,nmb,winbind,samba-bgqd}.service
 
-%clean
-rm -rf %{buildroot}
+install -d -m 0755 %{buildroot}%{_sysconfdir}/sysconfig
+printf 'SAMBAOPTIONS=""\n' > %{buildroot}%{_sysconfdir}/sysconfig/samba
+install -d -m 0755 %{buildroot}%{_tmpfilesdir}
+printf 'd /run/samba 0755 root root -\nd /run/lock/samba 0755 root root -\n' > %{buildroot}%{_tmpfilesdir}/samba.conf
+# /var/lock and /run are runtime tmpfs on RHEL; tmpfiles.d creates them.
+rm -rf %{buildroot}/var/lock %{buildroot}/run
+install -d %{buildroot}/run/samba
+
+# Header files and pkgconfig belong in a -devel package; not needed on a DC.
+rm -rf %{buildroot}%{_includedir} %{buildroot}%{_libdir}/pkgconfig
+
+%post
+%systemd_post samba.service
+%tmpfiles_create samba.conf
+
+%preun
+%systemd_preun samba.service
+
+%postun
+%systemd_postun_with_restart samba.service
 
 %files
-%defattr(-,root,root,-)
-/usr/bin/*
-/usr/sbin/*
-/usr/lib64/*
-/usr/lib/*
-/usr/libexec/*
-/usr/share/*
-/usr/include/*
-/etc/samba
-/var/lib/samba
-/var/log/samba
-/var/run/samba
-/var/cache/samba
-/var/lock/samba
+%license COPYING
+%{_bindir}/*
+%{_sbindir}/*
+%{_libdir}/*.so*
+%{_libdir}/samba
+%{_libdir}/security/pam_winbind.so
+%{_libdir}/krb5/plugins/kdb/samba.so
+%{python3_sitearch}/*
+%{_libexecdir}/samba
+%{_datadir}/samba
+%{_datadir}/locale/*/LC_MESSAGES/*.mo
+%{_mandir}/man*/*
+%{_unitdir}/samba.service
+%{_tmpfilesdir}/samba.conf
+%config(noreplace) %{_sysconfdir}/sysconfig/samba
+%dir %{_sysconfdir}/samba
+%dir %{_localstatedir}/lib/samba
+%dir %attr(0700,root,root) %{_localstatedir}/lib/samba/private
+%dir %{_localstatedir}/lib/samba/bind-dns
+%dir %{_localstatedir}/log/samba
+%dir %{_localstatedir}/cache/samba
+%ghost %dir /run/samba

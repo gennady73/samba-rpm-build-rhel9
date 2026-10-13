@@ -50,10 +50,12 @@ samba-rpm-build-rhel9/
 ├── Containerfile.samba-test       # UBI 9 Test container definition for package verification
 ├── rpm/                           # Pre-Built RPM Packages
 ├── spec/
-│   └── samba.spec.in              # Externalized RPM spec template with Python 3 dependencies
+│   ├── samba.spec.in              # RPM spec template
+│   └── ctdb.spec.in               # Unused upstream template (kept for reference)
 ├── scripts/
-│   ├── build-samba-rpm.sh         # Production compilation & RPM packaging script
-│   └── test-samba-rpm.sh          # Containerized smoke test harness
+│   ├── build-samba-rpm.sh         # rpmbuild -ba: RPM + self-contained SRPM
+│   ├── test-samba-rpm.sh          # Host-side runtime test harness (podman/docker)
+│   └── runtime-gates.sh           # Gates executed inside the UBI 9 test container
 └── output/
     └── .gitkeep                   # Target directory for generated .rpm packages
 ```
@@ -73,84 +75,69 @@ samba-rpm-build-rhel9/
 
 ### Step 1: Clone Repository
 ```bash
-git clone https://github.com/your-org/samba-rpm-build-rhel9.git
+git clone https://github.com/gennady73/samba-rpm-build-rhel9.git
 cd samba-rpm-build-rhel9
 ```
 
 ### Step 2: Build the Compilation Container
-If building on an unsubscribed host or requiring Red Hat Subscription Manager (RHSM) repositories for CRB access, pass `RH_USER` and `RH_PASS` as build arguments:
+On a **registered RHEL 9 host**, podman passes the host subscription into UBI builds automatically; no credentials are needed:
 
 ```bash
-# Option A: Standard Build (UBI 9 Default Repositories)
 podman build -t samba-ad-builder -f Containerfile.samba-build .
-
-# Option B: With Red Hat Subscription Manager Credentials
-podman build -t samba-ad-builder   --build-arg RH_USER="your_rhsm_username"   --build-arg RH_PASS="your_rhsm_password"   -f Containerfile.samba-build .
 ```
 
-### Step 3: Execute RPM Compilation
-Run the build container, mounting the `output/` directory, `spec/` folder, and compilation script.
-
-> **Note on Version Selection:** Pass `-e SAMBA_TAG="samba-4.24.7"` to lock compilation to a specific stable release tag. If `-e SAMBA_TAG` is omitted, the build script defaults to cloning and building the latest Samba `master` development branch.
+On an unregistered host, put the credentials in a file that never enters the image and pass it as a build secret:
 
 ```bash
-chmod +x scripts/build-samba-rpm.sh
-
-# Build a specific Samba release tag (Recommended):
-podman run --rm   -e SAMBA_TAG="samba-4.24.7"   -v $(pwd)/output:/build/output:z   -v $(pwd)/spec:/build/spec:ro,z   -v $(pwd)/scripts/build-samba-rpm.sh:/build/build-samba-rpm.sh:ro,z   samba-ad-builder /build/build-samba-rpm.sh
+printf 'RH_USER=%s\nRH_PASS=%s\n' 'your_user' 'your_password' > ~/.rhsm.env && chmod 600 ~/.rhsm.env
+podman build --secret id=rhsm,src=$HOME/.rhsm.env -t samba-ad-builder -f Containerfile.samba-build .
 ```
 
-Upon completion, compiled packages (`samba-ad-dc-4.24.7-1.el9.x86_64.rpm`) will be exported to `./output/`.
+> **Never pass passwords with `--build-arg`.** Build arguments are recorded in the image history and can be read with `podman history --no-trunc`.
+
+### Step 3: Build the RPM and SRPM
+`SAMBA_TAG` is required and must be a release tag. The spec compiles from `Source0`, so the resulting SRPM rebuilds on its own with `rpmbuild --rebuild`.
+
+```bash
+podman run --rm \
+  -e SAMBA_TAG="samba-4.24.7" \
+  -v "$(pwd)/output":/build/output:z \
+  -v "$(pwd)/spec":/build/spec:ro,z \
+  -v "$(pwd)/scripts/build-samba-rpm.sh":/build/build-samba-rpm.sh:ro,z \
+  samba-ad-builder bash /build/build-samba-rpm.sh
+```
+
+If `git.samba.org` is unreachable, add `-e SAMBA_GIT=https://github.com/samba-team/samba.git`, or mount a release tarball and set `-e SAMBA_TARBALL=/src/samba-4.24.7.tar.gz`.
+
+Output: `output/samba-ad-dc-4.24.7-2.el9.x86_64.rpm` and `output/samba-ad-dc-4.24.7-2.el9.src.rpm`.
 
 ---
 
-### Step 4: Containerized Smoke Test & Verification
+### Step 4: Runtime Test (`scripts/test-samba-rpm.sh`)
 
-The automated smoke test harness (`scripts/test-samba-rpm.sh`) verifies that newly built RPM packages resolve dependencies and provision Active Directory correctly without panicking. It supports GNU-style `--argname=value` CLI options and built-in help (`--help`).
-
-#### 1. Display Usage & Options (`--help`)
-Run the test script with `-h` or `--help` to view all available options, parameters, and environment variable fallbacks:
+The harness starts a privileged UBI 9 container on its own network, installs the RPM and runs `scripts/runtime-gates.sh`. It proves the package works as a domain controller, not only that provisioning finishes.
 
 ```bash
-chmod +x scripts/test-samba-rpm.sh
 ./scripts/test-samba-rpm.sh --help
+./scripts/test-samba-rpm.sh                                  # registered RHEL host, tests ./output
+./scripts/test-samba-rpm.sh --rpm-dir=./rpm                  # test the committed pre-built RPM
+./scripts/test-samba-rpm.sh --rhsm-secret=$HOME/.rhsm.env    # unregistered host
+./scripts/test-samba-rpm.sh --no-build --offline             # reuse image, all repos disabled
 ```
 
-#### 2. Execute the Test Harness
+Gates (exit code = number of failures):
 
-You can pass options using standard `--argname=value` syntax or set environment variables:
+| # | Gate |
+| :--- | :--- |
+| 1 | `dnf localinstall` resolves every dependency (`--offline`: from the image alone) |
+| 2 | Packaging: `samba.service`, `pam_winbind.so` in `/usr/lib64/security`, no libraries under `/usr/lib`, every shared library resolves, `rpm -V` clean |
+| 3 | `samba-tool domain provision` (SAMBA_INTERNAL DNS) |
+| 4 | `samba` starts, spawns MIT `krb5kdc`; ports 53, 88, 389, 445, 636 accept TCP |
+| 5 | `kinit`, LDAP read and write over GSSAPI, `kinit` as a new user, SMB `sysvol`/`netlogon`, DNS SRV records |
+| 6 | GPO: `ntacl sysvolcheck`, `gpo create`/`setlink`/`backup`/`restore`, `dbcheck --cross-ncs` |
+| 7 | BIND9 DLZ with the RHEL 9 BIND 9.16 (`dlz_bind9_16.so`) serves the AD SRV records |
 
-```bash
-# Option A: Standard Execution (Runs with default configuration)
-./scripts/test-samba-rpm.sh
-
-# Option B: Explicit CLI Arguments (--argname=value notation)
-./scripts/test-samba-rpm.sh   --rh-user="your_rhsm_username"   --rh-pass="your_rhsm_password"   --output-dir="$(pwd)/output"
-
-# Option C: Environment Variable Fallback
-export RH_USER="your_rhsm_username"
-export RH_PASS="your_rhsm_password"
-./scripts/test-samba-rpm.sh
-```
-
-> **Note on Execution Context**: `scripts/test-samba-rpm.sh` automatically detects rootless vs. rootful execution environments. In a rootless shell, it automatically invokes `sudo podman` to ensure proper user namespace and POSIX extended attribute (`xattr`) allocation during domain provisioning.
-
-#### 3. Verification Gates Executed by `scripts/test-samba-rpm.sh` 
-
-The harness script executes three sequential verification gates:
-
-1. **Automated Image Build**: Builds `localhost/samba-ad-tester:latest` using `Containerfile.samba-test`, forwarding `RH_USER`/`RH_PASS` build arguments if specified.
-2. **RPM Dependency Resolution & Installation Gate**: Mounts `./output/` read-only into the test container, installs packages via `dnf localinstall -y /output/*.rpm`, and validates binary installation and version responses (`samba -V`, `samba-tool --version`, `winbindd -V`, `smbclient --version`).
-3. **Domain Provisioning Gate**: Runs `samba-tool domain provision` under elevated container capabilities (`--privileged`, `--cap-add=SYS_ADMIN`, `--security-opt label=disable`, `--tmpfs /var/lib/samba:rw,exec,mode=1777`), verifying LDB datastore creation (`sam.ldb`), forest update execution, Kerberos configuration (`krb5.conf`), and structural `smb.conf` validity.
-
-#### 4. Expected Output
-Upon successful verification across all three gates, the test harness exits with code `0` and outputs:
-
-```text
-==========================================================
-  SUCCESS: Samba AD DC RPMs passed all verification gates!
-==========================================================
-```
+Expected result: `SUCCESS: all runtime gates passed`.
 
 ---
 
@@ -169,18 +156,13 @@ Samba 4 AD DC is configured with system MIT Kerberos integration to ensure nativ
             --disable-iprint
 ```
 
-### 5.2 Extended Attribute (`xattr`) & Container Isolation Override
-During `samba-tool domain provision`, Samba writes NT ACLs (`security.NTACL`) to `/var/lib/samba/sysvol/` via `vfs_acl_xattr.so`. In rootless Podman containers, host user namespace restrictions block `fsetxattr` calls, triggering a **Security context active token stack underflow panic**.
+### 5.2 Extended Attributes (`xattr`) in Containers
+Provisioning writes NT ACLs to `security.NTACL` extended attributes on SysVol. Setting `security.*` attributes needs `CAP_SYS_ADMIN`, so the test container runs rootful and `--privileged`, with `--security-opt label=disable`. It also needs a network with a non-loopback IPv4 address: with `--network none` Samba binds only loopback and Kerberos, LDAP and SMB checks fail.
 
-The verification script (`scripts/test-samba-rpm.sh`) resolves this by supplying container isolation bypass flags:
-
-```bash
-podman run --rm   -v "$(pwd)/output":/output:ro,z   --privileged   --cap-add=SYS_ADMIN   --security-opt label=disable   --security-opt seccomp=unconfined   --tmpfs /var/lib/samba:rw,exec,mode=1777   localhost/samba-ad-tester:latest bash -c "..."
-```
-
-* **`--cap-add=SYS_ADMIN` & `--privileged`**: Grants POSIX extended attribute privileges inside UBI 9.
-* **`--security-opt label=disable`**: Disables host SELinux container process labeling.
-* **`--tmpfs /var/lib/samba:rw,exec,mode=1777`**: Mounts an in-memory POSIX filesystem with full xattr support.
+### 5.3 Known Limitations
+* **MIT Kerberos AD DC is experimental upstream.** Samba does not issue security fixes for this mode; RODC and authentication audit logging are unsupported. Maintained Heimdal-based el9 packages exist and are the lower-risk choice for production.
+* **One package, conflicting files.** `samba-ad-dc` contains the client libraries, tools and Python bindings that RHEL ships as `samba-client-libs`, `libwbclient`, `python3-samba` and others; the spec declares `Conflicts:` for them. A host cannot have both.
+* **No `-devel` subpackage**: headers and pkgconfig files are dropped.
 
 ---
 

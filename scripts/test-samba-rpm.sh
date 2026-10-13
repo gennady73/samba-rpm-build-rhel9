@@ -1,244 +1,119 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Script Name:  test-samba-rpm.sh
-# Description:  Samba 4 AD DC RPM Containerized Smoke Test for UBI-9 / Podman
+# Description:  Containerized runtime test for the samba-ad-dc RPM on UBI 9.
 #
-# What it does: This is the script that aimed to pass custom Samba RPM verification gates.
-#               It spins up a Red Hat UBI-9 container under Podman, installs the 
-#               built RPMs (dnf localinstall), and runs "samba-tool domain provision" 
-#               to verify that the RPMs work end-to-end without crashing.
+# Builds (or reuses) the test image, starts a privileged UBI 9 container on
+# its own network, installs the RPM and runs scripts/runtime-gates.sh:
+# provisioning, the MIT KDC, Kerberos, LDAP, SMB, DNS, GPO handling and
+# BIND9 DLZ. Exit code = number of failed gates.
 #
-# Used in CI/CD to "test and validate" the custom Samba RPMs before putting them on real servers.
-#
+# Red Hat credentials are NOT needed when the host is a registered RHEL
+# system: podman shares the host subscription with UBI builds. Otherwise pass
+# --rhsm-secret=<file> (a file containing RH_USER=... and RH_PASS=...), which
+# is mounted with `podman build --secret` and never stored in the image.
 # =============================================================================
 set -euo pipefail
 
-# Default parameters
-OUTPUT_DIR="$(pwd)/output"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(dirname "${SCRIPT_DIR}")"
+RPM_DIR="${REPO_DIR}/output"
 IMAGE_NAME="localhost/samba-ad-tester:latest"
-CONTAINERFILE="Containerfile.samba-test"
-REALM="TEST.LOCAL"
-DOMAIN="TEST"
-ADMINPASS="P@ssw0rd2026!"
-RH_USER="${RH_USER:-}"
-RH_PASS="${RH_PASS:-}"
+CONTAINERFILE="${REPO_DIR}/Containerfile.samba-test"
+RHSM_SECRET=""
+BUILD_IMAGE=1
+OFFLINE=0
+ENGINE="${CONTAINER_ENGINE:-}"
+NETWORK="samba-ad-test"
 
 show_help() {
     cat << EOF
 Usage: $(basename "$0") [OPTIONS]
 
-Samba 4 AD DC RPM Containerized Smoke Test Harness for RHEL 9 / UBI 9
-
 Options:
-  --rh-user=<username>     Red Hat Subscription Manager username
-  --rh-pass=<password>     Red Hat Subscription Manager password
-  --output-dir=<path>      Directory containing built RPM packages (default: ./output)
-  --image-name=<tag>       Test container image tag (default: localhost/samba-ad-tester:latest)
-  --containerfile=<path>   Path to test Containerfile (default: Containerfile.samba-test)
-  --realm=<realm>          Test Active Directory realm (default: TEST.LOCAL)
-  --domain=<domain>        Test Active Directory NetBIOS domain (default: TEST)
-  --adminpass=<password>   Test Active Directory administrator password (default: P@ssw0rd2026!)
-  -h, --help               Display this help message and exit
-
-Environment Variables:
-  RH_USER                  Fallback for --rh-user if option is omitted
-  RH_PASS                  Fallback for --rh-pass if option is omitted
+  --rpm-dir=<path>        Directory with samba-ad-dc-*.x86_64.rpm
+                          (default: ./output, falls back to ./rpm)
+  --image-name=<tag>      Test image tag (default: ${IMAGE_NAME})
+  --containerfile=<path>  Test Containerfile (default: Containerfile.samba-test)
+  --rhsm-secret=<file>    File with RH_USER=/RH_PASS= for unregistered hosts
+  --no-build              Reuse an existing test image
+  --offline               Install the RPM with all repositories disabled
+                          (proves the image already holds every dependency)
+  --engine=<podman|docker>
+  -h, --help              Show this help
 
 Examples:
-  # Run smoke test with default settings:
-  ./scripts/test-samba-rpm.sh
-
-  # Pass RHSM credentials using --argname=value notation:
-  ./scripts/test-samba-rpm.sh --rh-user="my_username" --rh-pass="my_password"
-
-  # Specify custom RPM output directory and container tag:
-  ./scripts/test-samba-rpm.sh --output-dir="/tmp/rpms" --image-name="samba-test:v1"
+  $(basename "$0")                               # registered RHEL host
+  $(basename "$0") --rpm-dir=./rpm --no-build    # test the committed RPM
+  $(basename "$0") --rhsm-secret=\$HOME/.rhsm.env  # unregistered host
 EOF
 }
 
-SHOW_INFO_HEADER=false
-if [ $# -eq 0 ]; then
-    SHOW_INFO_HEADER=true
-fi
-
-# Parse options using --argname=value notation
-while [ $# -gt 0 ]; do
-    case "$1" in
-        -h|--help)
-            show_help
-            exit 0
-            ;;
-        --rh-user=*)
-            RH_USER="${1#*=}"
-            ;;
-        --rh-user)
-            RH_USER="$2"
-            shift
-            ;;
-        --rh-pass=*)
-            RH_PASS="${1#*=}"
-            ;;
-        --rh-pass)
-            RH_PASS="$2"
-            shift
-            ;;
-        --output-dir=*)
-            OUTPUT_DIR="${1#*=}"
-            ;;
-        --output-dir)
-            OUTPUT_DIR="$2"
-            shift
-            ;;
-        --image-name=*)
-            IMAGE_NAME="${1#*=}"
-            ;;
-        --image-name)
-            IMAGE_NAME="$2"
-            shift
-            ;;
-        --containerfile=*)
-            CONTAINERFILE="${1#*=}"
-            ;;
-        --containerfile)
-            CONTAINERFILE="$2"
-            shift
-            ;;
-        --realm=*)
-            REALM="${1#*=}"
-            ;;
-        --realm)
-            REALM="$2"
-            shift
-            ;;
-        --domain=*)
-            DOMAIN="${1#*=}"
-            ;;
-        --domain)
-            DOMAIN="$2"
-            shift
-            ;;
-        --adminpass=*)
-            ADMINPASS="${1#*=}"
-            ;;
-        --adminpass)
-            ADMINPASS="$2"
-            shift
-            ;;
-        *)
-            echo "ERROR: Unknown option '$1'"
-            echo "Run '$(basename "$0") --help' to view available options."
-            exit 1
-            ;;
+for arg in "$@"; do
+    case "${arg}" in
+        -h|--help)          show_help; exit 0 ;;
+        --rpm-dir=*)        RPM_DIR="${arg#*=}" ;;
+        --output-dir=*)     RPM_DIR="${arg#*=}" ;;   # backward compatible
+        --image-name=*)     IMAGE_NAME="${arg#*=}" ;;
+        --containerfile=*)  CONTAINERFILE="${arg#*=}" ;;
+        --rhsm-secret=*)    RHSM_SECRET="${arg#*=}" ;;
+        --no-build)         BUILD_IMAGE=0 ;;
+        --offline)          OFFLINE=1 ;;
+        --engine=*)         ENGINE="${arg#*=}" ;;
+        *) echo "ERROR: unknown option '${arg}' (see --help)" >&2; exit 2 ;;
     esac
-    shift
 done
 
-echo "=========================================================="
-echo "  Samba 4 AD DC RPM Containerized Smoke Test"
-echo "  Target Environment: Red Hat UBI 9 / Podman / Docker"
-echo "=========================================================="
+if [ -z "${ENGINE}" ]; then
+    if command -v podman >/dev/null; then ENGINE=podman
+    elif command -v docker >/dev/null; then ENGINE=docker
+    else echo "ERROR: neither podman nor docker found" >&2; exit 2; fi
+fi
+SUDO=""
+if [ "${EUID}" -ne 0 ] && [ "${ENGINE}" = podman ]; then
+    # Privileged containers need rootful podman for security.* xattrs.
+    SUDO="sudo"
+fi
+RUN="${SUDO} ${ENGINE}"
 
-if [ $SHOW_INFO_HEADER = true ]; then
-    echo "INFO: Running smoke test with default configuration."
-    echo "      Use --help to view all configurable CLI options."
-    echo ""
-    exit 1
+if ! ls "${RPM_DIR}"/samba-ad-dc-*.x86_64.rpm >/dev/null 2>&1; then
+    if ls "${REPO_DIR}"/rpm/samba-ad-dc-*.x86_64.rpm >/dev/null 2>&1; then
+        RPM_DIR="${REPO_DIR}/rpm"
+    else
+        echo "ERROR: no samba-ad-dc-*.x86_64.rpm in ${RPM_DIR}; run build-samba-rpm.sh first" >&2
+        exit 2
+    fi
+fi
+echo "===> Testing: $(ls "${RPM_DIR}"/samba-ad-dc-*.x86_64.rpm)"
+
+if [ "${BUILD_IMAGE}" = 1 ]; then
+    echo "===> [1/3] Building test image ${IMAGE_NAME}"
+    SECRET_ARGS=()
+    if [ -n "${RHSM_SECRET}" ]; then
+        [ -r "${RHSM_SECRET}" ] || { echo "ERROR: cannot read ${RHSM_SECRET}" >&2; exit 2; }
+        SECRET_ARGS=(--secret "id=rhsm,src=${RHSM_SECRET}")
+    fi
+    ${RUN} build "${SECRET_ARGS[@]}" -t "${IMAGE_NAME}" -f "${CONTAINERFILE}" "${REPO_DIR}"
+else
+    echo "===> [1/3] Reusing image ${IMAGE_NAME}"
 fi
 
-if [ -z "${RH_USER}"] || ["${RH_PASS}"]; then
-    echo "ERROR: Red Hat Subscription credentials are empty or not provided."
-    echo "       Use --help to view all configurable CLI options."
-    echo ""
-    exit 1
-fi
+echo "===> [2/3] Preparing network ${NETWORK}"
+${RUN} network exists "${NETWORK}" 2>/dev/null \
+    || ${RUN} network inspect "${NETWORK}" >/dev/null 2>&1 \
+    || ${RUN} network create "${NETWORK}" >/dev/null
 
-if [ ! -d "$OUTPUT_DIR" ] || [ -z "$(ls -A "$OUTPUT_DIR"/*.rpm 2>/dev/null)" ]; then
-    echo "ERROR: No .rpm packages found in $OUTPUT_DIR. Please run build-samba-rpm.sh first."
-    echo "       Use --help to view all configurable CLI options."
-    echo ""
-    exit 1
-fi
-
-echo "===> Found RPM packages in $OUTPUT_DIR:"
-ls -lh "$OUTPUT_DIR"/*.rpm
-
-if [ ! -f "$CONTAINERFILE" ]; then
-    echo "ERROR: $CONTAINERFILE not found in current directory."
-    exit 1
-fi
-
-# Determine Podman execution context (rootful vs rootless) at top of script
-PODMAN_CMD="podman"
-if [ "$EUID" -ne 0 ] && command -v sudo &>/dev/null; then
-    echo "---> Rootless environment detected. Using 'sudo podman' (Method 2: Privileged) for full xattr/ACL permissions."
-    PODMAN_CMD="sudo podman"
-fi
-
-# Construct build arguments for RHSM if credentials are provided
-BUILD_ARGS=()
-if [ -n "${RH_USER}" ] && [ -n "${RH_PASS}" ]; then
-    echo "---> Red Hat Subscription credentials detected. Forwarding to container build..."
-    BUILD_ARGS+=("--build-arg" "RH_USER=${RH_USER}" "--build-arg" "RH_PASS=${RH_PASS}")
-fi
-
-echo ""
-echo "===> [1/3] Building UBI 9 Test Container Image using ${PODMAN_CMD}..."
-$PODMAN_CMD build -t "$IMAGE_NAME" "${BUILD_ARGS[@]}" -f "$CONTAINERFILE" .
-
-echo ""
-echo "===> [2/3] Testing RPM Dependency Resolution & Binary Installation..."
-$PODMAN_CMD run --rm \
-  -v "$OUTPUT_DIR":/output:ro,z \
-  "$IMAGE_NAME" bash -c "
-    set -euo pipefail
-    echo '---> Installing locally built RPMs via dnf...'
-    dnf localinstall -y /output/*.rpm
-    
-    echo '---> [PASS] Local RPM installation succeeded!'
-    echo '---> Checking installed binary versions:'
-    /usr/sbin/samba -V
-    /usr/bin/samba-tool --version
-    /usr/sbin/winbindd -V
-    /usr/bin/smbclient --version
-"
-
-echo ""
-echo "===> [3/3] Executing Samba AD DC Domain Provisioning Smoke Test..."
-echo "       Applying Extended Attribute & Container Isolation Bypass Flags..."
-
-$PODMAN_CMD run --rm \
-  --privileged \
-  --cap-add=SYS_ADMIN \
-  --security-opt label=disable \
-  --security-opt seccomp=unconfined \
-  --tmpfs /var/lib/samba:rw,exec,mode=1777 \
-  -v "$OUTPUT_DIR":/output:ro,z \
-  "$IMAGE_NAME" bash -c "
-    set -euo pipefail
-    dnf localinstall -y /output/*.rpm > /dev/null 2>&1
-    
-    echo '---> Cleaning placeholder configuration files...'
-    rm -f /etc/samba/smb.conf /etc/krb5.conf
-    
-    echo '---> Executing samba-tool domain provision...'
-    samba-tool domain provision \
-      --server-role=dc \
-      --use-rfc2307 \
-      --dns-backend=SAMBA_INTERNAL \
-      --realm='${REALM}' \
-      --domain='${DOMAIN}' \
-      --adminpass='${ADMINPASS}'
-    
-    echo '---> Verifying generated Kerberos configuration...'
-    cp /var/lib/samba/private/krb5.conf /etc/krb5.conf
-    
-    echo '---> Checking smb.conf presence and structural validity...'
-    test -f /etc/samba/smb.conf
-    
-    echo '---> [PASS] Domain provisioning completed successfully with zero panics!'
-"
-
-echo ""
-echo "=========================================================="
-echo "  SUCCESS: Samba AD DC RPMs passed all verification gates!"
-echo "=========================================================="
+echo "===> [3/3] Running runtime gates"
+set +e
+${RUN} run --rm \
+    --privileged \
+    --security-opt label=disable \
+    --network "${NETWORK}" \
+    --hostname dc1 \
+    -e OFFLINE="${OFFLINE}" \
+    -v "${RPM_DIR}":/output:ro,z \
+    -v "${SCRIPT_DIR}/runtime-gates.sh":/runtime-gates.sh:ro,z \
+    "${IMAGE_NAME}" bash /runtime-gates.sh
+RC=$?
+set -e
+exit "${RC}"
